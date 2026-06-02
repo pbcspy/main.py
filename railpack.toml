@@ -1,0 +1,5 @@
+[build]
+cmd = "pip install -r requirements.txt"
+
+[start]
+cmd = "python spysol.py"
