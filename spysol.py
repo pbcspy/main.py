@@ -11,7 +11,7 @@ CHAT_ID = os.environ["CHAT_ID"]
 
 CONFIG = {
     "MAX_MC":        100_000_000,
-    "SCAN_INTERVAL": 120,           # seconds between scans
+    "SCAN_INTERVAL": 20,           # ⚡ every 20 seconds
 }
 
 seen: set = set()
@@ -31,9 +31,9 @@ SEARCH_TERMS = [
 ]
 
 
-# ── Data fetching (sync, runs in thread pool) ─────────────────────────────────
+# ── Data fetching ─────────────────────────────────────────────────────────────
 
-def _fetch_dex_search(chain):
+def _fetch_dex_search():
     pairs = []
     for term in SEARCH_TERMS:
         try:
@@ -42,14 +42,14 @@ def _fetch_dex_search(chain):
                 timeout=10, headers=HEADERS,
             )
             for p in r.json().get("pairs", []):
-                if p.get("chainId") == chain:
+                if p.get("chainId") == "solana":   # ✅ Solana only
                     pairs.append(p)
         except Exception:
             pass
     return pairs
 
 
-def _fetch_dex_latest(chain):
+def _fetch_dex_latest():
     pairs = []
     addresses = []
     for endpoint in [
@@ -61,7 +61,7 @@ def _fetch_dex_latest(chain):
             items = r.json() if isinstance(r.json(), list) else []
             addresses += [
                 i["tokenAddress"] for i in items
-                if i.get("chainId") == chain and i.get("tokenAddress")
+                if i.get("chainId") == "solana" and i.get("tokenAddress")
             ]
         except Exception:
             pass
@@ -78,12 +78,35 @@ def _fetch_dex_latest(chain):
     return pairs
 
 
+def _fetch_pump_fun():
+    """Fetch directly from pump.fun new tokens"""
+    pairs = []
+    try:
+        r = requests.get(
+            "https://api.dexscreener.com/latest/dex/search?q=pump.fun&chain=solana",
+            timeout=10, headers=HEADERS,
+        )
+        pairs += r.json().get("pairs", [])
+    except Exception:
+        pass
+    try:
+        r2 = requests.get(
+            "https://api.dexscreener.com/latest/dex/search?q=pumpfun&chain=solana",
+            timeout=10, headers=HEADERS,
+        )
+        pairs += r2.json().get("pairs", [])
+    except Exception:
+        pass
+    return pairs
+
+
 def _get_all_pairs():
     pairs = []
-    for chain in ["solana", "base"]:
-        pairs += _fetch_dex_search(chain)
-        pairs += _fetch_dex_latest(chain)
-    # Deduplicate by base token address
+    pairs += _fetch_dex_search()
+    pairs += _fetch_dex_latest()
+    pairs += _fetch_pump_fun()
+
+    # Deduplicate
     seen_addrs: set = set()
     unique = []
     for p in pairs:
@@ -92,6 +115,23 @@ def _get_all_pairs():
             seen_addrs.add(addr)
             unique.append(p)
     return unique
+
+
+def _get_dev_wallet(pair):
+    """Try to get dev/deployer wallet"""
+    try:
+        info = pair.get("info") or {}
+        # Sometimes in socials or websites
+        for s in info.get("socials", []):
+            if s.get("type", "").lower() in ["deployer", "dev"]:
+                return s.get("url", "")
+        # Try from pair url
+        url = pair.get("url", "")
+        if "raydium" in url or "pump" in url:
+            return "pump.fun deployer"
+    except Exception:
+        pass
+    return None
 
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
@@ -135,6 +175,7 @@ def _analyze(pair):
             "chg":       chg,
             "age_label": _token_age_label(pair),
             "chain":     pair.get("chainId", "solana"),
+            "dev":       _get_dev_wallet(pair),
         }
     except Exception:
         return None
@@ -148,20 +189,25 @@ def _fmt(n):
     return f"${n:.0f}"
 
 
-# ── Telegram (async) ──────────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
 
 async def send_alert(bot: Bot, t: dict):
     chg_str = f"+{t['chg']:.1f}%" if t["chg"] >= 0 else f"{t['chg']:.1f}%"
+    
+    dev_line = f"🧑‍💻 Dev: `{t['dev']}`\n" if t.get("dev") else ""
+
     msg = (
         f"🚨 *{t['name']}* (${t['symbol']})\n"
-        f"⛓ {t['chain'].upper()}  🕐 {t['age_label']} old\n\n"
+        f"⛓ SOLANA  🕐 {t['age_label']} old\n\n"
         f"📋 `{t['addr']}`\n\n"
         f"💰 MC: {_fmt(t['mc'])}\n"
         f"💧 Liq: {_fmt(t['liq'])}\n"
         f"📊 Vol 1H: {_fmt(t['vol'])}\n"
         f"📈 Change: {chg_str}\n\n"
-        f"🛡️ [RugCheck](https://rugcheck.xyz/tokens/{t['addr']})  "
-        f"🐦 [Birdeye](https://birdeye.so/token/{t['addr']})"
+        f"{dev_line}"
+        f"\n🛡️ [RugCheck](https://rugcheck.xyz/tokens/{t['addr']})  "
+        f"🐦 [Birdeye](https://birdeye.so/token/{t['addr']})\n\n"
+        f"👤 @Spy88"
     )
     await bot.send_message(
         chat_id=CHAT_ID,
@@ -172,21 +218,20 @@ async def send_alert(bot: Bot, t: dict):
     print(f"[{datetime.now():%H:%M:%S}] ✅ {t['name']} ({t['symbol']}) — {t['age_label']} old")
 
 
-# ── Main async loop ───────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────────
 
 async def main():
     bot = Bot(token=TELEGRAM_TOKEN)
 
-    # Warm up: cache current tokens, don't alert on them
-    print(f"[{datetime.now():%H:%M:%S}] ⏳ Warming up...")
+    print(f"[{datetime.now():%H:%M:%S}] ⏳ Warming up (Solana only)...")
     loop = asyncio.get_running_loop()
     pairs = await loop.run_in_executor(None, _get_all_pairs)
     for p in pairs:
         addr = (p.get("baseToken") or {}).get("address", "")
         if addr:
             seen.add(addr)
-    print(f"    Warm-up done — {len(seen)} tokens cached. Scanning every "
-          f"{CONFIG['SCAN_INTERVAL']//60}m for new ones...")
+    print(f"    Warm-up done — {len(seen)} tokens cached.")
+    print(f"    Scanning every {CONFIG['SCAN_INTERVAL']}s for new Solana tokens...")
 
     while True:
         await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
@@ -199,12 +244,12 @@ async def main():
                 try:
                     await send_alert(bot, token)
                     sent += 1
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.1)   # ⚡ fast sending
                 except Exception as e:
                     print(f"    Send error: {e}")
         print(f"    Fetched {len(pairs)} unique — sent {sent} alerts")
 
 
 if __name__ == "__main__":
-    print("🚀 Meme Coin Scanner — running!")
+    print("🚀 SPYSOL — Solana Scanner running!")
     asyncio.run(main())
